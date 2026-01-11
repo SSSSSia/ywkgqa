@@ -79,7 +79,7 @@ def select_relations(string, entity_id, head_relations, tail_relations):
             relations.append({"entity": entity_id, "relation": relation, "head": False})
 
     if not relations:
-        return False, "No relations found"
+        return False, []
     return True, relations
 
 # dao: kgdao
@@ -299,7 +299,11 @@ def entity_condition_prune(question,
                 # prune_entity_prompt 需要在外部定义 (如 prompt_list.py)
                 # 格式示例: "问题: Q. 三元组: Taylor Swift Born_in ['USA', 'China']"
                 prompt = prune_entity_prompt + question + '\nTriples: '
-                prompt += entid_name[topic_e_id] + ' ' + rela_name + ' ' + str(sorted_ename_list)
+                # prompt += entid_name[topic_e_id] + ' ' + rela_name + ' ' + str(sorted_ename_list)
+                sub = entid_name[topic_e_id]
+                rel = rela_name
+                prompt += " ".join([f"({sub}, {rel}, {obj})" for obj in sorted_ename_list])
+
 
                 # 调用 LLM (移除 token 统计接收)
                 # run_llm 假设返回 (生成文本, token字典)
@@ -369,6 +373,73 @@ def entity_condition_prune(question,
     # 返回精简后的结果 (移除了 cur_call_time, cur_token)
     return True, cluster_chain_of_entities, filter_entities_id, filter_relations, filter_head, new_ent_rel_ent_dict
 
+
+import ast
+import re
+from prompts import answer_prompt
+
+
+def answer(question, enames, cluster_chain_of_entities, chat_model):
+    """
+    根据问题、初始实体和推理链生成最终答案。
+    """
+
+    # --- 1. 定义递归展平函数 ---
+    def flatten_triplets(data):
+        """递归处理最高 N 层的嵌套列表，提取 tuple"""
+        triplets = []
+        if isinstance(data, list):
+            for item in data:
+                triplets.extend(flatten_triplets(item))
+        elif isinstance(data, tuple):
+            # 找到三元组 (h, r, t)
+            if len(data) == 3:
+                triplets.append(f"({data[0]}, {data[1]}, {data[2]})")
+        return triplets
+
+    # --- 2. 展平数据 ---
+    all_triplets = flatten_triplets(cluster_chain_of_entities)
+
+    # 去重处理，避免推理路径中有重复的三元组干扰 LLM
+    seen = set()
+    unique_triplets = [x for x in all_triplets if not (x in seen or seen.add(x))]
+
+    triplets_str = "\n".join(unique_triplets) if unique_triplets else "No relevant triplets found."
+    topic_entities_str = ", ".join(enames)
+
+    # --- 3. 构建 Prompt (使用之前定义的 answer_prompt) ---
+    prompt = answer_prompt.format(
+        topic_entities=topic_entities_str,
+        triplets=triplets_str,
+        question=question
+    )
+
+    # --- 4. 调用 LLM ---
+    try:
+        response = chat_model.chat_(prompt)
+
+        # --- 5. 解析输出 ---
+        # 匹配最外层的 [ ... ]
+        match = re.search(r'\[.*\]', response, re.DOTALL)
+        if match:
+            list_str = match.group()
+            # 安全转换为 Python 列表
+            try:
+                ans_list = ast.literal_eval(list_str)
+                if isinstance(ans_list, list):
+                    # 确保只取前三个，且元素转为字符串
+                    return [str(name) for name in ans_list[:3]]
+            except:
+                # 如果 ast 失败，尝试通过逗号分隔
+                clean_str = list_str.replace('[', '').replace(']', '').replace('"', '').replace("'", "")
+                return [name.strip() for name in clean_str.split(',')][:3]
+
+        # 兜底处理：如果没找到列表格式，将整个回复视为一个字符串答案
+        return [response.strip()]
+
+    except Exception as e:
+        print(f"Error in utils.answer: {e}")
+        return []
 
 if __name__ == '__main__':
     # 1 test get_topic_entities
